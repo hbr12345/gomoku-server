@@ -71,7 +71,8 @@ Deno.serve({ port: PORT, hostname: "0.0.0.0" }, (req) => {
                         currentPlayer: 1,
                         board: emptyBoard(),
                         moves: [],
-                        pendingUndo: null
+                        pendingUndo: null,
+                        pendingRestart: null
                     };
                     currentRoomId = message.roomId;
                     currentRole = message.role;
@@ -199,6 +200,44 @@ Deno.serve({ port: PORT, hostname: "0.0.0.0" }, (req) => {
                     } else {
                         if (requester && requester.ws.readyState === 1) {
                             requester.ws.send(JSON.stringify({ type: "undoDenied" }));
+                        }
+                    }
+                    break;
+                }
+
+                case "restartRequest": {
+                    const rrRoom = rooms[message.roomId];
+                    if (!rrRoom || !rrRoom.gameStarted) return;
+                    if (rrRoom.pendingRestart) {
+                        socket.send(JSON.stringify({ type: "error", msg: "已有重新开始请求待处理" }));
+                        return;
+                    }
+                    const rrOpponent = rrRoom.players.find(p => p.role !== message.role && !p.isSpectator);
+                    if (!rrOpponent) return;
+                    rrRoom.pendingRestart = { requester: message.role };
+                    if (rrOpponent.ws.readyState === 1) {
+                        rrOpponent.ws.send(JSON.stringify({ type: "restartRequest", role: message.role, roomId: message.roomId }));
+                    }
+                    socket.send(JSON.stringify({ type: "restartRequested" }));
+                    break;
+                }
+
+                case "restartResponse": {
+                    const rsRoom = rooms[message.roomId];
+                    if (!rsRoom || !rsRoom.pendingRestart) return;
+                    const rsRequesterRole = rsRoom.pendingRestart.requester;
+                    const rsRequester = rsRoom.players.find(p => p.role === rsRequesterRole);
+                    rsRoom.pendingRestart = null;
+                    if (message.accept) {
+                        // 双方同意：清空棋盘/走子/结束状态，黑棋先手，广播同步重置
+                        rsRoom.board = emptyBoard();
+                        rsRoom.moves = [];
+                        rsRoom.gameOver = false;
+                        rsRoom.currentPlayer = 1;
+                        broadcast(message.roomId, null, { type: "restart", currentPlayer: 1 });
+                    } else {
+                        if (rsRequester && rsRequester.ws.readyState === 1) {
+                            rsRequester.ws.send(JSON.stringify({ type: "restartDenied" }));
                         }
                     }
                     break;
