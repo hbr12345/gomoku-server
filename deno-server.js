@@ -153,7 +153,7 @@ Deno.serve({ port: PORT, hostname: "0.0.0.0" }, (req) => {
                     const overRoom = rooms[message.roomId];
                     if (overRoom) overRoom.gameOver = true;
                     broadcast(message.roomId, socket, {
-                        type: "gameOver", winner: message.winner, reason: message.reason
+                        type: "gameOver", winner: message.winner, reason: message.reason, line: message.line || null
                     });
                     break;
 
