@@ -1,12 +1,13 @@
 // deno-server.js - 五子棋在线对战服务器（Deno Deploy 云端版，无外部依赖）
 // 部署：Deno Deploy 连接 GitHub 仓库，入口文件选 deno-server.js
-// 逻辑与本地 gobang-server.exe 完全一致
+// 支持：创建/加入房间、准备、落子、悔棋（对手同意制）、观战、离开房间
 
 const PORT = parseInt(Deno.env.get("PORT") || "8080");
 const rooms = {};
 
 console.log("五子棋在线对战服务器已启动，端口：" + PORT);
 
+// 广播给房间内除 excludeWs 外的所有连接（玩家+观战者）
 function broadcast(roomId, excludeWs, message) {
     const room = rooms[roomId];
     if (!room) return;
@@ -15,6 +16,27 @@ function broadcast(roomId, excludeWs, message) {
             player.ws.send(JSON.stringify(message));
         }
     });
+}
+
+// 初始化15x15空棋盘
+function emptyBoard() {
+    return Array.from({ length: 15 }, () => Array(15).fill(0));
+}
+
+// 房间快照（观战者加入时返回完整状态，用于恢复棋盘）
+function roomSnapshot(room) {
+    return {
+        board: room.board,
+        moves: room.moves,
+        currentPlayer: room.currentPlayer,
+        gameStarted: room.gameStarted,
+        gameOver: room.gameOver,
+        players: room.players.map(p => ({
+            role: p.role,
+            ready: p.ready,
+            isSpectator: !!p.isSpectator
+        }))
+    };
 }
 
 Deno.serve({ port: PORT, hostname: "0.0.0.0" }, (req) => {
@@ -43,9 +65,13 @@ Deno.serve({ port: PORT, hostname: "0.0.0.0" }, (req) => {
                         return;
                     }
                     rooms[message.roomId] = {
-                        players: [{ role: message.role, ready: false, ws: socket }],
+                        players: [{ role: message.role, ready: false, ws: socket, isSpectator: false }],
                         gameStarted: false,
-                        currentPlayer: 1
+                        gameOver: false,
+                        currentPlayer: 1,
+                        board: emptyBoard(),
+                        moves: [],
+                        pendingUndo: null
                     };
                     currentRoomId = message.roomId;
                     currentRole = message.role;
@@ -58,11 +84,12 @@ Deno.serve({ port: PORT, hostname: "0.0.0.0" }, (req) => {
                         socket.send(JSON.stringify({ type: "error", msg: "房间不存在" }));
                         return;
                     }
-                    if (room.players.length >= 2) {
+                    // 玩家数量（不含观战者）达到2即为满
+                    if (room.players.filter(p => !p.isSpectator).length >= 2) {
                         socket.send(JSON.stringify({ type: "error", msg: "房间已满" }));
                         return;
                     }
-                    room.players.push({ role: message.role, ready: false, ws: socket });
+                    room.players.push({ role: message.role, ready: false, ws: socket, isSpectator: false });
                     currentRoomId = message.roomId;
                     currentRole = message.role;
                     broadcast(message.roomId, socket, { type: "playerJoined", role: message.role });
@@ -70,13 +97,34 @@ Deno.serve({ port: PORT, hostname: "0.0.0.0" }, (req) => {
                     break;
                 }
 
+                case "spectate": {
+                    const room = rooms[message.roomId];
+                    if (!room) {
+                        socket.send(JSON.stringify({ type: "error", msg: "房间不存在" }));
+                        return;
+                    }
+                    if (room.players.length >= 6) { // 2名玩家 + 最多4名观战者
+                        socket.send(JSON.stringify({ type: "error", msg: "观战人数已满" }));
+                        return;
+                    }
+                    room.players.push({ role: 3, ready: false, ws: socket, isSpectator: true });
+                    currentRoomId = message.roomId;
+                    currentRole = 3;
+                    socket.send(JSON.stringify({
+                        type: "spectateSuccess",
+                        roomId: message.roomId,
+                        ...roomSnapshot(room)
+                    }));
+                    break;
+                }
+
                 case "playerReady": {
                     const readyRoom = rooms[message.roomId];
                     if (!readyRoom) return;
-                    const player = readyRoom.players.find(p => p.role === message.role);
+                    const player = readyRoom.players.find(p => p.role === message.role && !p.isSpectator);
                     if (player) player.ready = true;
                     broadcast(message.roomId, socket, { type: "playerReady", role: message.role });
-                    if (readyRoom.players.every(p => p.ready)) {
+                    if (readyRoom.players.filter(p => !p.isSpectator).every(p => p.ready)) {
                         readyRoom.gameStarted = true;
                         readyRoom.players.forEach(p => {
                             if (p.ws.readyState === 1) {
@@ -89,8 +137,11 @@ Deno.serve({ port: PORT, hostname: "0.0.0.0" }, (req) => {
 
                 case "move": {
                     const moveRoom = rooms[message.roomId];
-                    if (!moveRoom || !moveRoom.gameStarted) return;
+                    if (!moveRoom || !moveRoom.gameStarted || moveRoom.gameOver) return;
                     if (moveRoom.currentPlayer !== message.player) return;
+                    if (moveRoom.board[message.row]?.[message.col] !== 0) return; // 防重复落子
+                    moveRoom.board[message.row][message.col] = message.player;
+                    moveRoom.moves.push({ row: message.row, col: message.col, player: message.player });
                     broadcast(message.roomId, socket, {
                         type: "move", row: message.row, col: message.col, player: message.player
                     });
@@ -99,10 +150,59 @@ Deno.serve({ port: PORT, hostname: "0.0.0.0" }, (req) => {
                 }
 
                 case "gameOver":
+                    const overRoom = rooms[message.roomId];
+                    if (overRoom) overRoom.gameOver = true;
                     broadcast(message.roomId, socket, {
                         type: "gameOver", winner: message.winner, reason: message.reason
                     });
                     break;
+
+                case "undoRequest": {
+                    const undoRoom = rooms[message.roomId];
+                    if (!undoRoom || !undoRoom.gameStarted || undoRoom.gameOver) return;
+                    if (undoRoom.moves.length === 0) {
+                        socket.send(JSON.stringify({ type: "error", msg: "没有可撤销的棋子" }));
+                        return;
+                    }
+                    if (undoRoom.pendingUndo) {
+                        socket.send(JSON.stringify({ type: "error", msg: "已有悔棋请求待处理" }));
+                        return;
+                    }
+                    const opponent = undoRoom.players.find(p => p.role !== message.role && !p.isSpectator);
+                    if (!opponent) return;
+                    undoRoom.pendingUndo = { requester: message.role };
+                    if (opponent.ws.readyState === 1) {
+                        opponent.ws.send(JSON.stringify({ type: "undoRequest", role: message.role, roomId: message.roomId }));
+                    }
+                    socket.send(JSON.stringify({ type: "undoRequested" }));
+                    break;
+                }
+
+                case "undoResponse": {
+                    const respRoom = rooms[message.roomId];
+                    if (!respRoom || !respRoom.pendingUndo) return;
+                    const requesterRole = respRoom.pendingUndo.requester;
+                    const requester = respRoom.players.find(p => p.role === requesterRole);
+                    respRoom.pendingUndo = null;
+                    if (message.accept) {
+                        const lastMove = respRoom.moves.pop();
+                        if (lastMove) {
+                            respRoom.board[lastMove.row][lastMove.col] = 0;
+                            respRoom.currentPlayer = lastMove.player;
+                        }
+                        broadcast(message.roomId, null, {
+                            type: "undoApplied",
+                            row: lastMove ? lastMove.row : -1,
+                            col: lastMove ? lastMove.col : -1,
+                            currentPlayer: respRoom.currentPlayer
+                        });
+                    } else {
+                        if (requester && requester.ws.readyState === 1) {
+                            requester.ws.send(JSON.stringify({ type: "undoDenied" }));
+                        }
+                    }
+                    break;
+                }
 
                 case "leaveRoom": {
                     const leaveRoom = rooms[message.roomId];
