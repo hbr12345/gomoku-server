@@ -1,0 +1,9 @@
+{
+  "name": "gomoku-server",
+  "version": "1.0.0",
+  "description": "五子棋在线对战 WebSocket 服务器（云部署版）",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "type": "commonjs",
+  "dependencies": { "ws": "^8.19.0" }
+}
